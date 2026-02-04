@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Escáner Caravana (OCR)</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    body { margin: 0; background: #0b0c10; color: #e8e8e8; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 16px; }
+    .card { background: #141823; border: 1px solid #2a2f3a; border-radius: 14px; padding: 14px; }
+    .row { display: grid; gap: 12px; }
+    @media (min-width: 900px) { .row { grid-template-columns: 1.2fr .8fr; align-items: start; } }
+    h1 { margin: 0 0 10px 0; font-size: 18px; }
+    .muted { color: #b9c0cc; font-size: 13px; line-height: 1.35; }
+    video { width: 100%; border-radius: 12px; background: #000; }
+    .overlay { position: relative; }
+    .guide {
+      position: absolute; inset: 12% 8%;
+      border: 2px dashed rgba(255,255,255,.45);
+      border-radius: 12px;
+      pointer-events: none;
+    }
+    .controls { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+    button {
+      border: 1px solid #2a2f3a; background: #1b2230; color: #e8e8e8;
+      padding: 10px 12px; border-radius: 12px; font-weight: 600; cursor: pointer;
+    }
+    button.primary { background: #2a3cff; border-color: #2a3cff; }
+    button.danger { background: #ff2a2a; border-color: #ff2a2a; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 999px; border: 1px solid #2a2f3a; background: #0f1320; }
+    .big { font-size: 20px; font-weight: 800; letter-spacing: .5px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New"; }
+    input, select, textarea {
+      width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid #2a2f3a;
+      background: #0f1320; color: #e8e8e8; outline: none;
+    }
+    textarea { min-height: 80px; resize: vertical; }
+    label { font-size: 13px; color: #b9c0cc; display: block; margin: 10px 0 6px; }
+    .hidden { display: none !important; }
+    .hr { height: 1px; background: #2a2f3a; margin: 14px 0; }
+    .log { font-size: 12px; color: #b9c0cc; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Escáner de Caravana (OCR) – 10 dígitos + prefijo 03201</h1>
+    <div class="muted">
+      Si el OCR no carga vas a ver el progreso abajo. Esto NO funciona bien abierto como <b>archivo local</b>.
+      Usá HTTPS o un servidor (localhost).
+    </div>
+
+    <div class="row" style="margin-top: 12px;">
+      <div class="card">
+        <div class="overlay">
+          <video id="video" playsinline autoplay muted></video>
+          <div class="guide"></div>
+        </div>
+
+        <div class="controls">
+          <button id="btnStart" class="primary">Iniciar cámara</button>
+          <button id="btnStop" class="danger" disabled>Detener</button>
+          <span class="pill">Estado: <b id="status">Idle</b></span>
+          <span class="pill">Estabilidad: <b id="stable">0/3</b></span>
+        </div>
+
+        <div class="hr"></div>
+        <div class="log" id="debugLog"></div>
+
+        <canvas id="canvas" class="hidden"></canvas>
+      </div>
+
+      <div class="card">
+        <div class="pill" style="width:100%; justify-content: space-between;">
+          <span>Detectado (10):</span>
+          <span class="big mono" id="rawDigits">—</span>
+        </div>
+        <div style="height:10px"></div>
+        <div class="pill" style="width:100%; justify-content: space-between;">
+          <span>ID final (15):</span>
+          <span class="big mono" id="finalId">—</span>
+        </div>
+
+        <div class="controls" style="margin-top: 12px;">
+          <button id="btnRescan" disabled>Reescanear</button>
+        </div>
+
+        <div class="muted" style="margin-top: 12px;">
+          Regla: OCR → extrae solo dígitos → si son 10 y se repiten 3 veces seguidas: OK.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+  <script>
+    const PREFIX = "03201";
+    const REQUIRED_LEN = 10;
+    const STABLE_FRAMES = 3;
+    const OCR_INTERVAL_MS = 900; // arrancá más lento para que no ahogue el celu
+    const USE_ROI = true;
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+    const btnStart = document.getElementById("btnStart");
+    const btnStop = document.getElementById("btnStop");
+    const btnRescan = document.getElementById("btnRescan");
+
+    const statusEl = document.getElementById("status");
+    const stableEl = document.getElementById("stable");
+    const rawEl = document.getElementById("rawDigits");
+    const finalEl = document.getElementById("finalId");
+    const debugLog = document.getElementById("debugLog");
+
+    let stream = null;
+    let ocrTimer = null;
+    let isBusy = false;
+
+    let lastDigits = "";
+    let stableCount = 0;
+
+    let worker = null;
+
+    function setStatus(s){ statusEl.textContent = s; }
+    function log(s){ debugLog.textContent = s; }
+    function digitsOnly(s){ return (s||"").replace(/\D/g,""); }
+
+    function resetDetection(){
+      lastDigits = "";
+      stableCount = 0;
+      stableEl.textContent = `0/${STABLE_FRAMES}`;
+      rawEl.textContent = "—";
+      finalEl.textContent = "—";
+    }
+
+    async function warmupOCR(){
+      if (worker) return;
+
+      setStatus("Inicializando OCR… (descargando)");
+      log("Preparando OCR...\nSi esto queda clavado, estás en file:// o el navegador bloqueó descargas.\n");
+
+      worker = await Tesseract.createWorker("eng", 1, {
+        logger: m => {
+          // muestra progreso real
+          if (m && m.status) {
+            setStatus(`OCR: ${m.status} ${(m.progress!=null?Math.round(m.progress*100)+'%':'')}`);
+          }
+        },
+        workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/worker.min.js",
+        corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5/tesseract-core.wasm.js",
+        langPath: "https://tessdata.projectnaptha.com/4.0.0"
+      });
+
+      await worker.setParameters({
+        tessedit_char_whitelist: "0123456789ARar ",
+        preserve_interword_spaces: "1"
+      });
+
+      setStatus("OCR listo");
+      log("OCR listo. Apuntá a la caravana.\n");
+    }
+
+    async function startCamera(){
+      const constraints = { audio:false, video:{ facingMode:{ideal:"environment"}, width:{ideal:1280}, height:{ideal:720} } };
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      btnStop.disabled = false;
+      btnStart.disabled = true;
+      btnRescan.disabled = false;
+      resetDetection();
+
+      await warmupOCR();
+      setStatus("Escaneando…");
+      startOCRLoop();
+    }
+
+    function stopCamera(){
+      if (ocrTimer){ clearInterval(ocrTimer); ocrTimer=null; }
+      if (stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      btnRescan.disabled = true;
+      setStatus("Idle");
+    }
+
+    function getFrameBlob(){
+      const vw = video.videoWidth || 1280;
+      const vh = video.videoHeight || 720;
+      canvas.width = vw; canvas.height = vh;
+      ctx.drawImage(video, 0, 0, vw, vh);
+
+      if (USE_ROI){
+        const x = Math.floor(vw * 0.10);
+        const y = Math.floor(vh * 0.18);
+        const w = Math.floor(vw * 0.80);
+        const h = Math.floor(vh * 0.55);
+        const imageData = ctx.getImageData(x, y, w, h);
+        canvas.width = w; canvas.height = h;
+        ctx.putImageData(imageData, 0, 0);
+      }
+
+      return new Promise(resolve => canvas.toBlob(b=>resolve(b), "image/jpeg", 0.85));
+    }
+
+    function updateStability(raw10){
+      if (raw10 === lastDigits) stableCount++;
+      else { lastDigits = raw10; stableCount = 1; }
+      stableEl.textContent = `${stableCount}/${STABLE_FRAMES}`;
+      return stableCount >= STABLE_FRAMES;
+    }
+
+    async function runOCROnce(){
+      if (!worker || isBusy) return;
+      if (!video.videoWidth) return; // todavía no hay frame real
+      isBusy = true;
+      try {
+        const blob = await getFrameBlob();
+        const { data } = await worker.recognize(blob);
+        const text = (data && data.text) ? data.text : "";
+        const digits = digitsOnly(text);
+
+        log(`OCR texto: ${text.replace(/\s+/g," ").trim()}\nDígitos: ${digits}`);
+
+        if (digits.length === REQUIRED_LEN){
+          const ok = updateStability(digits);
+          if (ok){
+            rawEl.textContent = digits;
+            finalEl.textContent = PREFIX + digits;
+            setStatus("Lectura estable ✓");
+            clearInterval(ocrTimer); ocrTimer = null;
+          } else {
+            setStatus("Escaneando… (estabilizando)");
+          }
+        } else {
+          lastDigits = "";
+          stableCount = 0;
+          stableEl.textContent = `0/${STABLE_FRAMES}`;
+          setStatus("Buscando 10 dígitos…");
+        }
+      } catch (e){
+        setStatus("Error OCR (mirá el log)");
+        log("ERROR OCR:\n" + (e?.message || e));
+      } finally {
+        isBusy = false;
+      }
+    }
+
+    function startOCRLoop(){
+      if (ocrTimer) clearInterval(ocrTimer);
+      ocrTimer = setInterval(runOCROnce, OCR_INTERVAL_MS);
+    }
+
+    btnStart.addEventListener("click", async ()=>{
+      try { await startCamera(); }
+      catch(e){ setStatus("No se pudo abrir cámara"); log("ERROR CAMARA:\n"+(e?.message||e)); }
+    });
+    btnStop.addEventListener("click", ()=> stopCamera());
+    btnRescan.addEventListener("click", ()=>{
+      resetDetection();
+      setStatus("Escaneando…");
+      startOCRLoop();
+    });
+    window.addEventListener("beforeunload", ()=> stopCamera());
+  </script>
+</body>
+</html>
